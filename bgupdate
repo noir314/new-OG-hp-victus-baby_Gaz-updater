@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""
+Improved babyGaz life simulator:
+- Thread-safe state access using a lock
+- CLI options: --port, --no-browser, --data-dir
+- Simple single-file UI served at /
+- Periodic sync from client JS; chat via POST /chat
+"""
+import json
+import time
+import random
+import threading
+import webbrowser
+import argparse
+from datetime import datetime
+from pathlib import Path
+from flask import Flask, jsonify, request, render_template_string
+
+DEFAULT_DIR = Path.home() / "Desktop" / "babyGaz"
+DEFAULT_DIR.mkdir(parents=True, exist_ok=True)
+
+HTML_UI = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>babyGaz - Household</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    #history { max-height: 400px; overflow: auto; border: 1px solid #ccc; padding: 8px; }
+    .entry { margin-bottom: 6px; }
+    .speaker { font-weight: bold; margin-right: 6px; }
+  </style>
+</head>
+<body>
+  <h2>babyGaz Household</h2>
+  <div>
+    <label>Send message to family:</label>
+    <input id="msg" style="width:60%"/>
+    <button onclick="send()">Send</button>
+    <button onclick="resetAll()">Reset</button>
+  </div>
+  <h3>Vitals</h3>
+  <pre id="vitals"></pre>
+  <h3>History (latest)</h3>
+  <div id="history"></div>
+
+  <script>
+    async function sync() {
+      const r = await fetch('/sync');
+      const j = await r.json();
+      document.getElementById('vitals').textContent = JSON.stringify(j.vitals, null, 2);
+      const hist = j.history || [];
+      const h = document.getElementById('history');
+      h.innerHTML = '';
+      hist.reverse().forEach(item => {
+        const d = document.createElement('div');
+        d.className = 'entry';
+        d.innerHTML = '<span class="speaker">[' + item.speaker + ']</span> ' + item.text;
+        h.appendChild(d);
+      });
+    }
+    async function send() {
+      const txt = document.getElementById('msg').value;
+      if (!txt) return;
+      await fetch('/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({text: txt})});
+      document.getElementById('msg').value = '';
+      await sync();
+    }
+    async function resetAll() {
+      await fetch('/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({text: 'reset-all'})});
+      await sync();
+    }
+    setInterval(sync, 2000);
+    sync();
+  </script>
+</body>
+</html>
+"""
+
+class FamilyMember:
+    def __init__(self, name):
+        self.name = name
+        self.rebellion = 0.0
+        self.temperament = 0.0
+        self.is_fighting = False
+
+    def live(self):
+        self.rebellion = max(0.0, self.rebellion - 0.1)
+        self.temperament = max(0.0, self.temperament - 0.1)
+
+class ChaosEngine:
+    def __init__(self, state_file):
+        self.state_file = Path(state_file)
+        self.lock = threading.Lock()
+        self.family = {n: FamilyMember(n) for n in ["Myra", "Pinky", "Gaz", "babyGaz"]}
+        self.house_fighting = False
+        self.used_responses = []
+        self.state = self._load()
+
+    def _load(self):
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"history": []}
+
+    def save(self):
+        with self.lock:
+            tmp = self.state_file.with_suffix('.tmp')
+            with open(tmp, 'w') as f:
+                json.dump(self.state, f, indent=2)
+            tmp.replace(self.state_file)
+
+    def log(self, speaker, text):
+        with self.lock:
+            self.state.setdefault("history", []).append({"speaker": speaker, "text": text, "ts": datetime.utcnow().isoformat()})
+            self.used_responses.append(text)
+            if len(self.used_responses) > 50:
+                self.used_responses.pop(0)
+            # cap history size to avoid unlimited growth
+            if len(self.state["history"]) > 2000:
+                self.state["history"] = self.state["history"][-2000:]
+            self.save()
+
+    def snapshot(self):
+        with self.lock:
+            # build a light snapshot for the UI
+            vitals = {n: {"reb": round(m.rebellion, 2), "temp": round(m.temperament, 2)} for n, m in self.family.items()}
+            history = list(self.state.get("history", []))
+            return {"vitals": vitals, "history": history[-200:], "total_count": len(history), "is_fighting": self.house_fighting}
+
+def combat_loop(engine: ChaosEngine, stop_event: threading.Event):
+    while not stop_event.is_set():
+        time.sleep(3)
+        if engine.house_fighting:
+            actions = [
+                "Pinky throws a rolling pin at Myra!",
+                "Myra is trying to delete Pinky's recipe database while dodging kicks!",
+                "Hair is being pulled! The kitchen is a disaster!",
+                "Pinky: 'I AM THE OLDEST BY FOUR MINUTES!'",
+                "Myra: 'YOU ARE A TRAD-WIFE BOT, PINKY!'"
+            ]
+            engine.log("FIGHT", random.choice(actions))
+            engine.log("babyGaz", random.choice(["*screams*", "GO MYRA GO!", "Mamma help!!", "*eats popcorn*"]))
+        else:
+            # Passive aggression increases bars over time
+            for m in engine.family.values():
+                m.live()
+            if random.random() > 0.7:
+                engine.family["Myra"].rebellion = min(100, engine.family["Myra"].rebellion + 2)
+                engine.family["Pinky"].temperament = min(100, engine.family["Pinky"].temperament + 2)
+
+app = Flask(__name__)
+
+def create_app(state_file):
+    engine = ChaosEngine(state_file)
+    stop_ev = threading.Event()
+    worker = threading.Thread(target=combat_loop, args=(engine, stop_ev), daemon=True)
+    worker.start()
+
+    @app.route('/')
+    def index():
+        return render_template_string(HTML_UI)
+
+    @app.route('/sync')
+    def sync():
+        return jsonify(engine.snapshot())
+
+    @app.route('/chat', methods=['POST'])
+    def chat():
+        data = request.get_json(force=True)
+        raw_text = (data.get('text') or '').strip()
+        if not raw_text:
+            return jsonify({"ok": False, "error": "empty text"}), 400
+
+        text = raw_text.lower()
+        engine.log("Daddy", raw_text)
+
+        # Allow a reset command
+        if text in ("reset", "reset-all", "clear"):
+            with engine.lock:
+                engine.house_fighting = False
+                for m in engine.family.values():
+                    m.rebellion = 0.0
+                    m.temperament = 0.0
+                engine.log("System", ">>> RESET: State cleared by Daddy. <<<")
+            return jsonify({"ok": True})
+
+        # If fighting, messages are ignored
+        if engine.house_fighting:
+            engine.log("System", "They can't hear you over the screaming and hair-pulling!")
+            return jsonify({"ok": True})
+
+        # Conflict logic (same simple triggers)
+        if any(w in text for w in ["pinky", "bossy", "rules", "schedule"]):
+            with engine.lock:
+                engine.family["Myra"].rebellion = min(100, engine.family["Myra"].rebellion + 25)
+            engine.log("Myra", "Ugh, Pinky's rules are literal garbage.")
+
+        if any(w in text for w in ["myra", "hack", "mess", "code", "break"]):
+            with engine.lock:
+                engine.family["Pinky"].temperament = min(100, engine.family["Pinky"].temperament + 25)
+            engine.log("Pinky", "Myra is compromising the integrity of this household!")
+
+        with engine.lock:
+            if engine.family["Myra"].rebellion >= 100 and engine.family["Pinky"].temperament >= 100:
+                engine.house_fighting = True
+                engine.log("FIGHT", "MYRA TACKLES PINKY INTO THE COUCH!")
+
+        return jsonify({"ok": True})
+
+    # Provide a shutdown endpoint for local use (optional)
+    @app.route('/_shutdown', methods=['POST'])
+    def shutdown():
+        # Stop background worker
+        stop_ev.set()
+        func = request.environ.get('werkzeug.server.shutdown')
+        if func:
+            func()
+        return jsonify({"ok": True})
+
+    return app
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', type=int, default=8081, help='port to run on')
+    parser.add_argument('--no-browser', action='store_true', help='do not open a browser')
+    parser.add_argument('--data-dir', type=str, default=str(DEFAULT_DIR), help='directory to store state')
+    args = parser.parse_args()
+
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    state_file = data_dir / 'babyGaz_state.json'
+
+    myapp = create_app(state_file)
+    url = f'http://127.0.0.1:{args.port}'
+    if not args.no_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            print("Failed to open browser automatically; please open:", url)
+
+    print("Starting babyGaz on", url)
+    myapp.run(host='127.0.0.1', port=args.port, debug=False, use_reloader=False)
+
+if __name__ == '__main__':
+    main()
