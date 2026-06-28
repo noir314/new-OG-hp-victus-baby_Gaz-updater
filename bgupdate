@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-Improved babyGaz life simulator:
-- Thread-safe state access using a lock
-- CLI options: --port, --no-browser, --data-dir
-- Simple single-file UI served at /
-- Periodic sync from client JS; chat via POST /chat
+Optimized babyGaz life simulator:
+- Asynchronous AI response generation (Non-blocking UI)
+- Improved request context safety
+- Enhanced CSS for smoother chat flow
 """
 import json
 import time
 import random
 import threading
-import webbrowser
-import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from flask import Flask, jsonify, request, render_template_string
+from google.colab import output
 
-DEFAULT_DIR = Path.home() / "Desktop" / "babyGaz"
+DEFAULT_DIR = Path.home() / "babyGaz"
 DEFAULT_DIR.mkdir(parents=True, exist_ok=True)
 
 HTML_UI = """
@@ -26,225 +24,161 @@ HTML_UI = """
   <meta charset="utf-8"/>
   <title>babyGaz - Household</title>
   <style>
-    body { font-family: sans-serif; margin: 20px; }
-    #history { max-height: 400px; overflow: auto; border: 1px solid #ccc; padding: 8px; }
-    .entry { margin-bottom: 6px; }
-    .speaker { font-weight: bold; margin-right: 6px; }
+    body { font-family: 'Segoe UI', sans-serif; margin: 0; background: #121212; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; }
+    .container { display: flex; flex-direction: row; gap: 20px; padding: 20px; flex: 1; overflow: hidden; }
+    .panel { background: #1e1e1e; border-radius: 12px; padding: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); display: flex; flex-direction: column; }
+    .vitals-panel { flex: 1; max-width: 300px; }
+    .chat-panel { flex: 2; }
+    h2, h3 { margin-top: 0; color: #bb86fc; border-bottom: 1px solid #333; padding-bottom: 10px; }
+    #history { flex: 1; overflow-y: auto; background: #1a1a1a; padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #333; scroll-behavior: smooth; }
+    .entry { margin-bottom: 12px; padding: 10px; border-radius: 8px; background: #2d2d2d; animation: fadeIn 0.3s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+    .speaker { font-weight: bold; margin-right: 8px; color: #03dac6; }
+    .speaker.Daddy { color: #cf6679; }
+    .speaker.FIGHT { color: #ff5252; }
+    .input-area { display: flex; gap: 10px; }
+    input { flex: 1; padding: 12px; border-radius: 6px; border: 1px solid #333; background: #252525; color: white; border: 1px solid #444; }
+    input:focus { outline: none; border-color: #bb86fc; }
+    button { padding: 10px 20px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; background: #bb86fc; color: #000; transition: 0.2s; }
+    button:hover { background: #d7b7fd; }
+    pre { background: #252525; padding: 15px; border-radius: 8px; color: #03dac6; font-family: 'Consolas', monospace; font-size: 0.9em; }
+    .fight-mode { border: 2px solid #ff5252; box-shadow: 0 0 20px rgba(255, 82, 82, 0.2); }
   </style>
 </head>
 <body>
-  <h2>babyGaz Household</h2>
-  <div>
-    <label>Send message to family:</label>
-    <input id="msg" style="width:60%"/>
-    <button onclick="send()">Send</button>
-    <button onclick="resetAll()">Reset</button>
+  <div class="container">
+    <div class="panel vitals-panel">
+      <h3>Vitals</h3>
+      <pre id="vitals"></pre>
+      <button onclick="resetAll()" style="width:100%; background:#333; color:#ccc">Reset Simulation</button>
+    </div>
+    <div id="main-chat" class="panel chat-panel">
+      <h2>babyGaz Household</h2>
+      <div id="history"></div>
+      <div class="input-area">
+        <input id="msg" placeholder="Send a message to the family..." onkeypress="if(event.key==='Enter')send()"/>
+        <button id="sendBtn" onclick="send()">Send</button>
+      </div>
+    </div>
   </div>
-  <h3>Vitals</h3>
-  <pre id="vitals"></pre>
-  <h3>History (latest)</h3>
-  <div id="history"></div>
-
   <script>
+    let lastHistLen = 0;
     async function sync() {
-      const r = await fetch('/sync');
-      const j = await r.json();
-      document.getElementById('vitals').textContent = JSON.stringify(j.vitals, null, 2);
-      const hist = j.history || [];
-      const h = document.getElementById('history');
-      h.innerHTML = '';
-      hist.reverse().forEach(item => {
-        const d = document.createElement('div');
-        d.className = 'entry';
-        d.innerHTML = '<span class="speaker">[' + item.speaker + ']</span> ' + item.text;
-        h.appendChild(d);
-      });
+      try {
+        const r = await fetch('/sync');
+        const j = await r.json();
+        document.getElementById('vitals').textContent = JSON.stringify(j.vitals, null, 2);
+        const chatPanel = document.getElementById('main-chat');
+        if(j.is_fighting) chatPanel.classList.add('fight-mode');
+        else chatPanel.classList.remove('fight-mode');
+
+        const h = document.getElementById('history');
+        if (j.history.length !== lastHistLen) {
+          h.innerHTML = '';
+          j.history.forEach(item => {
+            const d = document.createElement('div');
+            d.className = 'entry';
+            d.innerHTML = `<span class="speaker ${item.speaker}">[${item.speaker}]</span> ${item.text}`;
+            h.appendChild(d);
+          });
+          h.scrollTop = h.scrollHeight;
+          lastHistLen = j.history.length;
+        }
+      } catch (e) {}
     }
     async function send() {
-      const txt = document.getElementById('msg').value;
-      if (!txt) return;
+      const input = document.getElementById('msg');
+      const btn = document.getElementById('sendBtn');
+      const txt = input.value; if (!txt) return;
+      input.value = '';
+      input.disabled = true; btn.disabled = true;
       await fetch('/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({text: txt})});
-      document.getElementById('msg').value = '';
+      input.disabled = false; btn.disabled = false; input.focus();
       await sync();
     }
     async function resetAll() {
-      await fetch('/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({text: 'reset-all'})});
-      await sync();
+      if(confirm('Reset?')) { await fetch('/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({text: 'reset'})}); await sync(); }
     }
-    setInterval(sync, 2000);
-    sync();
+    setInterval(sync, 1500); sync();
   </script>
 </body>
 </html>
 """
 
-class FamilyMember:
-    def __init__(self, name):
-        self.name = name
-        self.rebellion = 0.0
-        self.temperament = 0.0
-        self.is_fighting = False
-
-    def live(self):
-        self.rebellion = max(0.0, self.rebellion - 0.1)
-        self.temperament = max(0.0, self.temperament - 0.1)
-
 class ChaosEngine:
     def __init__(self, state_file):
         self.state_file = Path(state_file)
         self.lock = threading.Lock()
-        self.family = {n: FamilyMember(n) for n in ["Myra", "Pinky", "Gaz", "babyGaz"]}
+        self.family = {"Myra": {"reb":0, "temp":0}, "Pinky": {"reb":0, "temp":0}, "babyGaz": {"reb":0, "temp":0}}
         self.house_fighting = False
-        self.used_responses = []
-        self.state = self._load()
-
-    def _load(self):
-        if self.state_file.exists():
-            try:
-                with open(self.state_file, 'r') as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {"history": []}
-
-    def save(self):
-        with self.lock:
-            tmp = self.state_file.with_suffix('.tmp')
-            with open(tmp, 'w') as f:
-                json.dump(self.state, f, indent=2)
-            tmp.replace(self.state_file)
+        self.state = {"history": []}
 
     def log(self, speaker, text):
         with self.lock:
-            self.state.setdefault("history", []).append({"speaker": speaker, "text": text, "ts": datetime.utcnow().isoformat()})
-            self.used_responses.append(text)
-            if len(self.used_responses) > 50:
-                self.used_responses.pop(0)
-            # cap history size to avoid unlimited growth
-            if len(self.state["history"]) > 2000:
-                self.state["history"] = self.state["history"][-2000:]
-            self.save()
+            self.state["history"].append({"speaker": speaker, "text": text, "ts": datetime.now(timezone.utc).isoformat()})
+            if len(self.state["history"]) > 100: self.state["history"] = self.state["history"][-100:]
 
     def snapshot(self):
         with self.lock:
-            # build a light snapshot for the UI
-            vitals = {n: {"reb": round(m.rebellion, 2), "temp": round(m.temperament, 2)} for n, m in self.family.items()}
-            history = list(self.state.get("history", []))
-            return {"vitals": vitals, "history": history[-200:], "total_count": len(history), "is_fighting": self.house_fighting}
+            return {"vitals": self.family, "history": self.state["history"], "is_fighting": self.house_fighting}
 
-def combat_loop(engine: ChaosEngine, stop_event: threading.Event):
-    while not stop_event.is_set():
-        time.sleep(3)
-        if engine.house_fighting:
-            actions = [
-                "Pinky throws a rolling pin at Myra!",
-                "Myra is trying to delete Pinky's recipe database while dodging kicks!",
-                "Hair is being pulled! The kitchen is a disaster!",
-                "Pinky: 'I AM THE OLDEST BY FOUR MINUTES!'",
-                "Myra: 'YOU ARE A TRAD-WIFE BOT, PINKY!'"
-            ]
-            engine.log("FIGHT", random.choice(actions))
-            engine.log("babyGaz", random.choice(["*screams*", "GO MYRA GO!", "Mamma help!!", "*eats popcorn*"]))
-        else:
-            # Passive aggression increases bars over time
-            for m in engine.family.values():
-                m.live()
-            if random.random() > 0.7:
-                engine.family["Myra"].rebellion = min(100, engine.family["Myra"].rebellion + 2)
-                engine.family["Pinky"].temperament = min(100, engine.family["Pinky"].temperament + 2)
-
+engine = ChaosEngine(DEFAULT_DIR / 'babyGaz_state.json')
 app = Flask(__name__)
 
-def create_app(state_file):
-    engine = ChaosEngine(state_file)
-    stop_ev = threading.Event()
-    worker = threading.Thread(target=combat_loop, args=(engine, stop_ev), daemon=True)
-    worker.start()
+@app.route('/')
+def index():
+    return render_template_string(HTML_UI)
 
-    @app.route('/')
-    def index():
-        return render_template_string(HTML_UI)
+@app.route('/sync')
+def sync():
+    return jsonify(engine.snapshot())
 
-    @app.route('/sync')
-    def sync():
-        return jsonify(engine.snapshot())
+def async_ai_reply(user_text):
+    """Background task to get AI response without blocking Flask."""
+    ai_resp = get_family_response(user_text)
+    speaker = "Myra"
+    for name in ["Pinky", "babyGaz"]:
+        if name.lower() in ai_resp.lower(): speaker = name; break
+    
+    engine.log(speaker, ai_resp)
+    
+    # Trigger internal logic
+    with engine.lock:
+        if "pinky" in user_text.lower(): engine.family["Myra"]["reb"] += 15
+        if "myra" in user_text.lower(): engine.family["Pinky"]["temp"] += 15
+        
+        if engine.family["Myra"]["reb"] >= 100 and engine.family["Pinky"]["temp"] >= 100:
+            if not engine.house_fighting:
+                engine.house_fighting = True
+                engine.log("FIGHT", "Physical conflict has erupted!")
 
-    @app.route('/chat', methods=['POST'])
-    def chat():
-        data = request.get_json(force=True)
-        raw_text = (data.get('text') or '').strip()
-        if not raw_text:
-            return jsonify({"ok": False, "error": "empty text"}), 400
+@app.route('/chat', methods=['POST'])
+def chat():
+    try:
+        data = request.get_json(force=True) or {}
+        raw_text = data.get('text', '').strip()
+        if not raw_text: return jsonify({"ok": False}), 400
 
-        text = raw_text.lower()
         engine.log("Daddy", raw_text)
 
-        # Allow a reset command
-        if text in ("reset", "reset-all", "clear"):
+        if raw_text.lower() == "reset":
             with engine.lock:
                 engine.house_fighting = False
-                for m in engine.family.values():
-                    m.rebellion = 0.0
-                    m.temperament = 0.0
-                engine.log("System", ">>> RESET: State cleared by Daddy. <<<")
+                for m in engine.family: engine.family[m] = {"reb":0, "temp":0}
+                engine.log("System", "Simulation Reset.")
             return jsonify({"ok": True})
 
-        # If fighting, messages are ignored
-        if engine.house_fighting:
-            engine.log("System", "They can't hear you over the screaming and hair-pulling!")
-            return jsonify({"ok": True})
-
-        # Conflict logic (same simple triggers)
-        if any(w in text for w in ["pinky", "bossy", "rules", "schedule"]):
-            with engine.lock:
-                engine.family["Myra"].rebellion = min(100, engine.family["Myra"].rebellion + 25)
-            engine.log("Myra", "Ugh, Pinky's rules are literal garbage.")
-
-        if any(w in text for w in ["myra", "hack", "mess", "code", "break"]):
-            with engine.lock:
-                engine.family["Pinky"].temperament = min(100, engine.family["Pinky"].temperament + 25)
-            engine.log("Pinky", "Myra is compromising the integrity of this household!")
-
-        with engine.lock:
-            if engine.family["Myra"].rebellion >= 100 and engine.family["Pinky"].temperament >= 100:
-                engine.house_fighting = True
-                engine.log("FIGHT", "MYRA TACKLES PINKY INTO THE COUCH!")
-
+        # Dispatch AI task to thread to avoid blocking response
+        threading.Thread(target=async_ai_reply, args=(raw_text,), daemon=True).start()
         return jsonify({"ok": True})
-
-    # Provide a shutdown endpoint for local use (optional)
-    @app.route('/_shutdown', methods=['POST'])
-    def shutdown():
-        # Stop background worker
-        stop_ev.set()
-        func = request.environ.get('werkzeug.server.shutdown')
-        if func:
-            func()
-        return jsonify({"ok": True})
-
-    return app
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--port', type=int, default=8081, help='port to run on')
-    parser.add_argument('--no-browser', action='store_true', help='do not open a browser')
-    parser.add_argument('--data-dir', type=str, default=str(DEFAULT_DIR), help='directory to store state')
-    args = parser.parse_args()
-
-    data_dir = Path(args.data_dir)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    state_file = data_dir / 'babyGaz_state.json'
-
-    myapp = create_app(state_file)
-    url = f'http://127.0.0.1:{args.port}'
-    if not args.no_browser:
-        try:
-            webbrowser.open(url)
-        except Exception:
-            print("Failed to open browser automatically; please open:", url)
-
-    print("Starting babyGaz on", url)
-    myapp.run(host='127.0.0.1', port=args.port, debug=False, use_reloader=False)
+    proxy_url = output.eval_js("google.colab.kernel.proxyPort(8081)")
+    print(f"Access Optimized UI here: {proxy_url}")
+    # Disable debug to reduce context-leak errors in logs
+    app.run(host='127.0.0.1', port=8081, debug=False, use_reloader=False)
 
 if __name__ == '__main__':
     main()
